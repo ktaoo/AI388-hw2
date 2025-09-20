@@ -1,11 +1,13 @@
 # models.py
 
+from collections import defaultdict
 import torch
 import torch.nn as nn
 from torch import optim
 import numpy as np
 import random
 from sentiment_data import *
+from nltk.metrics import edit_distance
 
 
 class SentimentClassifier(object):
@@ -35,6 +37,54 @@ class SentimentClassifier(object):
         """
         return [self.predict(ex_words, has_typos) for ex_words in all_ex_words]
 
+class TypoCorrector:
+    def __init__(self, word_indexer, max_edit_distance=2):
+        self.word_indexer = word_indexer
+        self.max_edit_distance = max_edit_distance
+        self.correction_cache = {}
+        
+        # Build prefix index based on the first 3 characters
+        self.prefix_to_words = defaultdict(list)
+
+        all_words = []
+        for i in range(len(word_indexer)):
+            word = word_indexer.get_object(i)
+            if word not in ["PAD", "UNK"]:
+                all_words.append(word)
+
+        for word in all_words:
+            if len(word) >= 3:
+                prefix = word[:3].lower()
+                self.prefix_to_words[prefix].append(word)
+    
+    def find_correction(self, typo_word):
+        if typo_word in self.correction_cache:
+            return self.correction_cache[typo_word]
+        
+        if len(typo_word) < 3:
+            self.correction_cache[typo_word] = None
+            return None
+        
+        prefix = typo_word[:3].lower()
+        candidates = self.prefix_to_words.get(prefix, [])
+        if not candidates:
+            self.correction_cache[typo_word] = None
+            return None
+        
+        best_word = None
+        best_distance = float('inf')
+        
+        for candidate in candidates:
+            if abs(len(candidate) - len(typo_word)) > self.max_edit_distance:
+                continue
+                
+            distance = edit_distance(typo_word.lower(), candidate.lower())
+            if distance <= self.max_edit_distance and distance < best_distance:
+                best_distance = distance
+                best_word = candidate
+        
+        self.correction_cache[typo_word] = best_word
+        return best_word
 
 class TrivialSentimentClassifier(SentimentClassifier):
     def predict(self, ex_words: List[str], has_typos: bool) -> int:
@@ -76,17 +126,24 @@ class DeepAveragingNetwork(nn.Module):
         return self.log_softmax(output)
 
 class NeuralSentimentClassifier(SentimentClassifier):
-    def __init__(self, model: DeepAveragingNetwork, word_embeddings: WordEmbeddings):
+    def __init__(self, model: DeepAveragingNetwork, word_embeddings: WordEmbeddings, use_typo_correction: bool = False):
         self.model = model
         self.word_embeddings = word_embeddings
         self.device = model.device
         self.model.eval()
+
+        self.typo_corrector = TypoCorrector(word_embeddings.word_indexer) if use_typo_correction else None
         
     def predict(self, ex_words: List[str], has_typos: bool) -> int:
         word_indices = []
         for word in ex_words:
             idx = self.word_embeddings.word_indexer.index_of(word)
-            if idx == -1:  # Unknown word
+            if idx == -1 and has_typos and self.typo_corrector:
+                corrected_word = self.typo_corrector.find_correction(word)
+                if corrected_word:
+                    idx = self.word_embeddings.word_indexer.index_of(corrected_word)
+
+            if idx == -1:
                 idx = self.word_embeddings.word_indexer.index_of("UNK")
             word_indices.append(idx)
 
@@ -122,6 +179,7 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
 
     criterion = nn.NLLLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    typo_corrector = TypoCorrector(word_embeddings.word_indexer) if train_model_for_typo_setting else None
 
     def prepare_data(examples):
         data = []
@@ -129,6 +187,11 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
             word_indices = []
             for word in ex.words:
                 idx = word_embeddings.word_indexer.index_of(word)
+                if idx == -1 and train_model_for_typo_setting and typo_corrector:
+                    corrected_word = typo_corrector.find_correction(word)
+                    if corrected_word:
+                        idx = word_embeddings.word_indexer.index_of(corrected_word)
+                
                 if idx == -1:  # Unknown word
                     idx = word_embeddings.word_indexer.index_of("UNK")
                 word_indices.append(idx)
@@ -190,5 +253,5 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
         print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss:.4f}, Dev Acc: {dev_acc:.4f}")
         model.train()
 
-    return NeuralSentimentClassifier(model, word_embeddings)
+    return NeuralSentimentClassifier(model, word_embeddings, use_typo_correction=train_model_for_typo_setting)
 
