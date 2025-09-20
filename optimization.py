@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 ### 
 # IMPLEMENT ME! REPLACE WITH YOUR ANSWER TO PART 1B
-OPTIMAL_STEP_SIZE = 1.0
+OPTIMAL_STEP_SIZE = 0.0625
 ###
 
 def _parse_args():
@@ -41,7 +41,10 @@ def quadratic_grad(x1, x2):
     :param x2: second coordinate
     :return: a one-dimensional numpy array containing two elements representing the gradient
     """
-    raise Exception("Implement me!")
+    grad_x1 = 2 * (x1 - 1)
+    grad_x2 = 16 * (x2 - 1)
+    
+    return np.array([grad_x1, grad_x2])
 
 
 def sgd_test_quadratic(args):
