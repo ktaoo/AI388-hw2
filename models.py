@@ -44,16 +44,59 @@ class TrivialSentimentClassifier(SentimentClassifier):
         """
         return 1
 
+class DeepAveragingNetwork(nn.Module):
+    def __init__(self, word_embeddings: WordEmbeddings, hidden_size: int = 64, num_classes: int = 2):
+        super(DeepAveragingNetwork, self).__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.embedding = word_embeddings.get_initialized_embedding_layer(frozen=False)
+        self.embedding_dim = word_embeddings.get_embedding_length()
+        self.word_indexer = word_embeddings.word_indexer
+        
+        self.fc1 = nn.Linear(self.embedding_dim, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, num_classes)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.2)
+        
+        self.log_softmax = nn.LogSoftmax(dim=1)
+        self.to(self.device)
+        
+    def forward(self, word_indices):
+        embedded = self.embedding(word_indices)
+        
+        mask = (word_indices != self.word_indexer.index_of("PAD")).float().unsqueeze(-1)
+        masked_embedded = embedded * mask
+        seq_lengths = mask.sum(dim=1).clamp(min=1)  # Avoid division by zero
+        averaged = masked_embedded.sum(dim=1) / seq_lengths
+
+        hidden = self.relu(self.fc1(averaged))
+        hidden = self.dropout(hidden)
+        output = self.fc2(hidden)
+
+        return self.log_softmax(output)
 
 class NeuralSentimentClassifier(SentimentClassifier):
-    """
-    Implement your NeuralSentimentClassifier here. This should wrap an instance of the network with learned weights
-    along with everything needed to run it on new data (word embeddings, etc.). You will need to implement the predict
-    method and you can optionally override predict_all if you want to use batching at inference time (not necessary,
-    but may make things faster!)
-    """
-    def __init__(self):
-        raise NotImplementedError
+    def __init__(self, model: DeepAveragingNetwork, word_embeddings: WordEmbeddings):
+        self.model = model
+        self.word_embeddings = word_embeddings
+        self.device = model.device
+        self.model.eval()
+        
+    def predict(self, ex_words: List[str], has_typos: bool) -> int:
+        word_indices = []
+        for word in ex_words:
+            idx = self.word_embeddings.word_indexer.index_of(word)
+            if idx == -1:  # Unknown word
+                idx = self.word_embeddings.word_indexer.index_of("UNK")
+            word_indices.append(idx)
+
+        word_tensor = torch.LongTensor(word_indices).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            log_probs = self.model(word_tensor)
+            pred = torch.argmax(log_probs, dim=1).item()
+        
+        return pred
 
 
 def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample],
@@ -68,5 +111,84 @@ def train_deep_averaging_network(args, train_exs: List[SentimentExample], dev_ex
     and return an instance of that for the typo setting if you want; you're allowed to return two different model types
     for the two settings.
     """
-    raise NotImplementedError
+    hidden_size = 100
+    learning_rate = 0.001
+    num_epochs = 5
+    batch_size = 128
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = DeepAveragingNetwork(word_embeddings, hidden_size)
+
+    criterion = nn.NLLLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    def prepare_data(examples):
+        data = []
+        for ex in examples:
+            word_indices = []
+            for word in ex.words:
+                idx = word_embeddings.word_indexer.index_of(word)
+                if idx == -1:  # Unknown word
+                    idx = word_embeddings.word_indexer.index_of("UNK")
+                word_indices.append(idx)
+            data.append((word_indices, ex.label))
+        return data
+    
+    train_data = prepare_data(train_exs)
+    dev_data = prepare_data(dev_exs)
+
+    model.train()
+    for epoch in range(num_epochs):
+        random.shuffle(train_data)
+        
+        total_loss = 0
+        num_batches = 0
+
+        for i in range(0, len(train_data), batch_size):
+            batch = train_data[i:i + batch_size]
+
+            max_len = max(len(word_indices) for word_indices, _ in batch)
+            pad_idx = word_embeddings.word_indexer.index_of("PAD")
+            
+            batch_inputs = []
+            batch_labels = []
+            
+            for word_indices, label in batch:
+                padded = word_indices + [pad_idx] * (max_len - len(word_indices))
+                batch_inputs.append(padded)
+                batch_labels.append(label)
+
+            inputs = torch.LongTensor(batch_inputs).to(device)
+            labels = torch.LongTensor(batch_labels).to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            num_batches += 1
+
+        model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for word_indices, label in dev_data:
+                inputs = torch.LongTensor(word_indices).unsqueeze(0).to(device)
+                outputs = model(inputs)
+                pred = torch.argmax(outputs, dim=1).item()
+                
+                if pred == label:
+                    correct += 1
+                total += 1
+        
+        dev_acc = correct / total
+        avg_loss = total_loss / num_batches
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss:.4f}, Dev Acc: {dev_acc:.4f}")
+        model.train()
+
+    return NeuralSentimentClassifier(model, word_embeddings)
 
